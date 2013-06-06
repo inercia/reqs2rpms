@@ -1,0 +1,217 @@
+#!/usr/bin/python
+
+import glob
+import os
+import argparse
+import shutil
+import shlex
+import logging
+from subprocess import Popen, PIPE
+import tempfile
+from time import sleep
+import sys
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+_VERSION = '1.0'
+_DESCRIPTION = """
+Utility for generating RPMs from a requirements file
+
+Example:
+
+$ ./reqs2rpms --keep-dir -r reqs.txt -o out_dir
+
+"""
+
+#: pattern for produced RPMs
+_RPMS_PATTERN = '*.noarch.rpm'
+
+#: the arguments for setup.py
+_BDIST_RPM_COMMAND = 'bdist_rpm -q'
+
+#: pip download command
+_PIP_DOWNLOAD_COMMAND = 'pip install --download {download_dir} --no-install {egg_desc}'
+
+#: file patterns and how to uncompress them
+_UNCOMPRESS_PATTERN_COMMAND = {
+    '*.tar.gz': 'tar xvpf {filename}',
+    '*.zip': 'unzip -xU {filename}',
+}
+
+
+def run_executable(args, wait=True, **kwargs):
+    """ Run an executable
+    :param args: a list of arguments to use when running the executable (optional)
+    """
+    close_fds = kwargs.pop('close_fds', True)
+    cwd = kwargs.pop('cwd', None)
+
+    proc = Popen(args, stdout=PIPE, stderr=PIPE, cwd=cwd, close_fds=close_fds, **kwargs)
+
+    if wait:
+        retcode = None
+        while True:
+            proc.poll()
+            if proc.returncode is not None:
+                retcode = proc.returncode
+                break
+            logger.debug(proc.stdout.read())
+            sleep(1)
+
+        return (retcode, proc)
+    else:
+        return (None, proc)
+
+
+def download_egg(egg_desc, download_dir):
+    """ Download an egg from a requirements.txt decription
+    """
+    logger.info('Downloading egg: %s', egg_desc)
+    args = shlex.split(_PIP_DOWNLOAD_COMMAND.format(download_dir=download_dir, egg_desc=egg_desc))
+    retcode, proc = run_executable(args=args)
+    if retcode != 0:
+        raise RuntimeError('pip returned code %d: "%s"' % (retcode, proc.stderr.read()))
+
+
+def uncompress_all(directory):
+    """ Uncompressed all files in a directory
+    """
+    for pattern, command in _UNCOMPRESS_PATTERN_COMMAND.iteritems():
+        logger.info('Uncompressing everything at %s', directory)
+        for f in glob.glob(directory + '/' + pattern):
+            if os.path.isfile(f):
+                args = shlex.split(command.format(filename=f))
+                logger.debug('... uncompressing %s', f)
+                retcode, proc = run_executable(args=args, cwd=directory)
+                if retcode != 0:
+                    raise RuntimeError('%s returned code %d: %s' % (args[0], retcode, proc.stderr.read()))
+                else:
+                    logger.debug('...... done! removing "%s"', f)
+                    os.remove(f)
+
+
+def build_rpm(directory, setup_py, python):
+    """ Build an RPM from a directory with a setup.py
+    :param directory:
+    :return:
+    """
+    logger.info('Building RPM from "%s"', setup_py)
+    args = [python, setup_py] + shlex.split(_BDIST_RPM_COMMAND)
+    retcode, proc = run_executable(args, cwd=directory, close_fds=False)
+    if retcode != 0:
+        raise RuntimeError('setup.py returned code %d when running %s: %s' % (retcode, setup_py, proc.stderr.read()))
+
+
+def collect_rpms(directory, out):
+    logger.info('Collecting RPMs at %s', directory)
+    dist_dir = os.path.join(directory, 'dist')
+    for f in glob.glob(dist_dir + '/' + _RPMS_PATTERN):
+        if os.path.isfile(f):
+            logger.debug('... found "%s" -> copying to "%s/"', directory, out)
+            shutil.copy(f, out)
+
+
+def reqs_to_rpms(reqs_file, output, download_dir, python):
+    logger.debug('Working on temporal directory "%s"', download_dir)
+
+    logger.info('Processing requirements file')
+    reqs = [req.strip() for req in reqs_file.readlines()]
+
+    # first of all, download all eggs
+    for req in reqs:
+        if req.startswith("#"):
+            continue
+        elif len(req) == 0:
+            continue
+        else:
+            download_egg(req, download_dir)
+
+    # ... uncompress things
+    uncompress_all(download_dir)
+
+    # look for setup.py's and run bdist_rpm on them...
+    for setup_py in glob.glob(download_dir + '/*/setup.py'):
+        d = os.path.dirname(setup_py)
+        build_rpm(d, setup_py, python=python)
+        collect_rpms(d, output)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=_DESCRIPTION,
+                                     formatter_class=argparse.RawTextHelpFormatter)
+
+    parser.add_argument('-r',
+                        '--reqs',
+                        dest='reqs_file',
+                        metavar='REQUIREMENTS',
+                        help='requirements file',
+                        required=True,
+                        type=argparse.FileType('r'),
+                        default=None)
+    parser.add_argument('-o',
+                        '--output',
+                        dest='output',
+                        metavar='DIRECTORY',
+                        required=True,
+                        help='output directory where RPMs are stored (will be created if it does not exist)',
+                        type=str,
+                        default=None)
+    parser.add_argument('--version',
+                        action='store_true',
+                        default=False,
+                        help='displays the version and exits.')
+
+    package = parser.add_argument_group('packaging options')
+    package.add_argument('--group',
+                         dest='group',
+                         metavar='GROUP',
+                         help='package group name',
+                         type=str,
+                         default=None)
+    package.add_argument('--release',
+                         dest='release',
+                         metavar='RELEASE',
+                         help='package release',
+                         type=str,
+                         default=None)
+
+    advanced = parser.add_argument_group('advanced options')
+    advanced.add_argument('--pip',
+                          dest='pip',
+                          metavar='EXECUTABLE',
+                          help='pip executable to use',
+                          type=str,
+                          default=None)
+    advanced.add_argument('--python',
+                          dest='python',
+                          metavar='EXECUTABLE',
+                          help='python executable to use (default: %s)' % sys.executable,
+                          type=str,
+                          default=sys.executable)
+    advanced.add_argument('--keep-dir',
+                          dest='keep_dir',
+                          action='store_true',
+                          help='keep build dirs after packaging',
+                          default=False)
+
+    args = parser.parse_args()
+
+    if args.version:
+        parser.exit(0, message='\nVersion: %s\n' % str(_VERSION))
+
+    if not os.path.exists(args.output):
+        logger.info('Creating output directory "%s"', args.output)
+        os.makedirs(args.output)
+
+    download_dir = tempfile.mkdtemp(prefix='reqs2rpm-')
+    try:
+        reqs_to_rpms(reqs_file=args.reqs_file, output=args.output, download_dir=download_dir, python=args.python)
+    finally:
+        if not args.keep_dir:
+            logger.debug('Removing temporal directory "%s"', download_dir)
+            shutil.rmtree(download_dir)
+
+
+if __name__ == '__main__':
+    main()

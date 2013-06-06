@@ -1,0 +1,6 @@
+# a comment
+circus==0.8.1
+sh
+-e git+https://github.com/defnull/bottle.git#egg=Bottle
+# comment
+
