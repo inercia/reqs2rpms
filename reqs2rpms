@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python2.7
 
 import glob
 import os
@@ -6,17 +6,18 @@ import argparse
 import shutil
 import shlex
 import logging
-from subprocess import Popen, PIPE
+from subprocess import Popen
 import tempfile
 from time import sleep
 import sys
+import platform
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 _VERSION = '1.0'
 _DESCRIPTION = """
-Utility for generating RPMs from a requirements file
+Utility for generating RPMs from a requirements.txt or a setup.py file
 
 Example:
 
@@ -24,20 +25,41 @@ $ ./reqs2rpms --keep-dir -r reqs.txt -o out_dir
 
 """
 
+#: default cache directory for downloads
+_DEFAULT_DOWN_CACHE = '/tmp/reqs2rpms'
+
 #: pattern for produced RPMs
-_RPMS_PATTERN = '*.noarch.rpm'
+_RPMS_PATTERNS = ['*.noarch.rpm',
+                  '*.%s.rpm' % platform.machine()]
+
+#: list of requirements we do not really want to download/install... (in lower case)
+_SKIP_REQS = {'setuptools', 'distribute'}
 
 #: the arguments for setup.py
-_BDIST_RPM_COMMAND = 'bdist_rpm -q'
+_BDIST_RPM_COMMAND = 'bdist_rpm --binary-only -q'
 
 #: pip download command
-_PIP_DOWNLOAD_COMMAND = 'pip install --download {download_dir} --no-install {egg_desc}'
+_PIP_DOWNLOAD_COMMAND = 'pip install -M %s --download-cache %s --download %s --no-install %s'
+
+#: pip download command
+_PIP_EDITABLE_COMMAND = 'pip install -M %s --download-cache %s --download %s --no-install -e %s'
 
 #: file patterns and how to uncompress them
 _UNCOMPRESS_PATTERN_COMMAND = {
     '*.tar.gz': 'tar xvpf {filename}',
     '*.zip': 'unzip -xU {filename}',
 }
+
+
+def _count_subdirs(directory):
+    """ Count the number of subdirectories in a directory
+    """
+    return len([d for d in glob.glob(directory + '/*') if os.path.isdir(d)])
+
+def _count_files(directory):
+    """ Count the number of files in a directory
+    """
+    return len([f for f in glob.glob(directory + '/*') if os.path.isfile(f)])
 
 
 def run_executable(args, wait=True, **kwargs):
@@ -47,8 +69,7 @@ def run_executable(args, wait=True, **kwargs):
     close_fds = kwargs.pop('close_fds', True)
     cwd = kwargs.pop('cwd', None)
 
-    proc = Popen(args, stdout=PIPE, stderr=PIPE, cwd=cwd, close_fds=close_fds, **kwargs)
-
+    proc = Popen(args, cwd=cwd, close_fds=close_fds, **kwargs)
     if wait:
         retcode = None
         while True:
@@ -56,22 +77,11 @@ def run_executable(args, wait=True, **kwargs):
             if proc.returncode is not None:
                 retcode = proc.returncode
                 break
-            logger.debug(proc.stdout.read())
             sleep(1)
 
-        return (retcode, proc)
+        return retcode, proc
     else:
-        return (None, proc)
-
-
-def download_egg(egg_desc, download_dir):
-    """ Download an egg from a requirements.txt decription
-    """
-    logger.info('Downloading egg: %s', egg_desc)
-    args = shlex.split(_PIP_DOWNLOAD_COMMAND.format(download_dir=download_dir, egg_desc=egg_desc))
-    retcode, proc = run_executable(args=args)
-    if retcode != 0:
-        raise RuntimeError('pip returned code %d: "%s"' % (retcode, proc.stderr.read()))
+        return None, proc
 
 
 def uncompress_all(directory):
@@ -85,57 +95,119 @@ def uncompress_all(directory):
                 logger.debug('... uncompressing %s', f)
                 retcode, proc = run_executable(args=args, cwd=directory)
                 if retcode != 0:
-                    raise RuntimeError('%s returned code %d: %s' % (args[0], retcode, proc.stderr.read()))
+                    raise RuntimeError('%s returned code %d' % (args[0], retcode))
                 else:
                     logger.debug('...... done! removing "%s"', f)
                     os.remove(f)
 
 
-def build_rpm(directory, setup_py, python):
+def build_rpm(directory, setup_py, python, ignore_build_errors=False):
     """ Build an RPM from a directory with a setup.py
     :param directory:
     :return:
     """
     logger.info('Building RPM from "%s"', setup_py)
-    args = [python, setup_py] + shlex.split(_BDIST_RPM_COMMAND)
+    args = [python, setup_py] + shlex.split(_BDIST_RPM_COMMAND) + ['--python', python]
     retcode, proc = run_executable(args, cwd=directory, close_fds=False)
-    if retcode != 0:
-        raise RuntimeError('setup.py returned code %d when running %s: %s' % (retcode, setup_py, proc.stderr.read()))
+    if retcode != 0 and not ignore_build_errors:
+        raise RuntimeError('setup.py returned code %d when running %s' % (retcode, setup_py))
 
 
 def collect_rpms(directory, out):
+    """ Collect all the RPMs we built
+    :param directory: directory where we look for RPMs
+    """
+    n = 0
     logger.info('Collecting RPMs at %s', directory)
     dist_dir = os.path.join(directory, 'dist')
-    for f in glob.glob(dist_dir + '/' + _RPMS_PATTERN):
-        if os.path.isfile(f):
-            logger.debug('... found "%s" -> copying to "%s/"', directory, out)
-            shutil.copy(f, out)
+    for pattern in _RPMS_PATTERNS:
+        for f in glob.glob(dist_dir + '/' + pattern):
+            if os.path.isfile(f):
+                logger.debug('... found "%s" -> copying to "%s/"', directory, out)
+                shutil.copy(f, out)
+                n += 1
+    logger.info('%d RPMs generated from %s', n, directory)
+    return n
 
 
-def reqs_to_rpms(reqs_file, output, download_dir, python):
+def post_process(output, download_dir, python, remove_setup_cfg=False, ignore_build_errors=False):
+    """ Uncompress and install things
+    :param ignore_build_errors: ignore errors when building, trying to build as many packages as we can
+    """
+    # uncompress things
+    uncompress_all(download_dir)
+
+    try:
+        # look for setup.py's and run bdist_rpm on them...
+        for setup_py in glob.glob(download_dir + '/*/setup.py'):
+            dirname = os.path.dirname(setup_py)
+            basename = os.path.basename(dirname)
+            basename_split = basename.rsplit('-', 1)
+            if basename_split[0].lower() in _SKIP_REQS:
+                logger.info('Skipping %s...', basename_split[0])
+                continue
+            else:
+                if remove_setup_cfg:
+                    setup_cfg = os.path.join(dirname, 'setup.cfg')
+                    if os.path.exists(setup_cfg):
+                        logger.debug('removing %s', setup_cfg)
+                        os.remove(setup_cfg)
+
+                logger.info('*************** Processing %s ***************', basename_split[0])
+                build_rpm(dirname, setup_py, python=python, ignore_build_errors=ignore_build_errors)
+                collect_rpms(dirname, output)
+    finally:
+        logger.info('post processing finished: %d packages downloaded, %d RPMs generated',
+                    _count_subdirs(download_dir), _count_files(output))
+
+def download_from_reqs(reqs_file, download_dir, download_cache):
+    """ Download everything from a requirements file
+    """
+    logger.info('Processing requirements file')
     logger.debug('Working on temporal directory "%s"', download_dir)
 
-    logger.info('Processing requirements file')
+    n = 0
     reqs = [req.strip() for req in reqs_file.readlines()]
 
     # first of all, download all eggs
-    for req in reqs:
+    for req_desc in reqs:
         if req.startswith("#"):
             continue
         elif len(req) == 0:
             continue
         else:
-            download_egg(req, download_dir)
+            logger.info('Downloading requirement: %s', req_desc)
+            extra = ''
+            pip_command = _PIP_DOWNLOAD_COMMAND % (extra, download_cache, download_dir, req_desc)
+            args = shlex.split(pip_command)
+            retcode, proc = run_executable(args=args)
+            if retcode != 0:
+                raise RuntimeError('pip returned code %d' % retcode)
+            else:
+                n += 1
+    return n
 
-    # ... uncompress things
-    uncompress_all(download_dir)
 
-    # look for setup.py's and run bdist_rpm on them...
-    for setup_py in glob.glob(download_dir + '/*/setup.py'):
-        d = os.path.dirname(setup_py)
-        build_rpm(d, setup_py, python=python)
-        collect_rpms(d, output)
+def download_from_setup(setup_file, download_dir, download_cache):
+    """ Download everything from a setup.py file
+    """
+    n = 0
 
+    if os.path.isfile(setup_file):
+        dirname = os.path.abspath(os.path.dirname(setup_file))
+    else:
+        dirname = os.path.abspath(setup_file)
+
+    logger.info('Processing setup.py file from %s', dirname)
+    extra = ''
+    pip_command = _PIP_EDITABLE_COMMAND % (extra, download_cache, download_dir, dirname)
+    args = shlex.split(pip_command)
+
+    retcode, proc = run_executable(args=args)
+    if retcode != 0:
+        raise RuntimeError('pip returned code %d' % retcode)
+
+    n = len(glob.glob(download_dir + '/*'))
 
 def main():
     parser = argparse.ArgumentParser(description=_DESCRIPTION,
@@ -146,8 +218,14 @@ def main():
                         dest='reqs_file',
                         metavar='REQUIREMENTS',
                         help='requirements file',
-                        required=True,
                         type=argparse.FileType('r'),
+                        default=None)
+    parser.add_argument('-s',
+                        '--setup',
+                        dest='setup_file',
+                        metavar='SETUP_PY',
+                        help='setup.py file',
+                        type=str,
                         default=None)
     parser.add_argument('-o',
                         '--output',
@@ -161,6 +239,13 @@ def main():
                         action='store_true',
                         default=False,
                         help='displays the version and exits.')
+    parser.add_argument('-c',
+                        '--cache',
+                        dest='download_cache',
+                        metavar='DIRECTORY',
+                        help='directory where downloads are cached',
+                        type=str,
+                        default=_DEFAULT_DOWN_CACHE)
 
     package = parser.add_argument_group('packaging options')
     package.add_argument('--group',
@@ -194,11 +279,24 @@ def main():
                           action='store_true',
                           help='keep build dirs after packaging',
                           default=False)
+    advanced.add_argument('--ignore-build-errors',
+                          dest='ignore_build_errors',
+                          action='store_true',
+                          help='ignore errors when building, trying to build other packages',
+                          default=False)
+    advanced.add_argument('--keep-setup-cfg',
+                          dest='remove_setup_cfg',
+                          action='store_false',
+                          help='keep the setup.cfg file found in packages (can break some RPM builds)',
+                          default=True)
 
     args = parser.parse_args()
 
     if args.version:
         parser.exit(0, message='\nVersion: %s\n' % str(_VERSION))
+
+    if not (args.reqs_file or args.setup_file):
+        parser.exit(1, message='\nShould provide either a requirements.txt or a setup.py file\n')
 
     if not os.path.exists(args.output):
         logger.info('Creating output directory "%s"', args.output)
@@ -206,7 +304,15 @@ def main():
 
     download_dir = tempfile.mkdtemp(prefix='reqs2rpm-')
     try:
-        reqs_to_rpms(reqs_file=args.reqs_file, output=args.output, download_dir=download_dir, python=args.python)
+        if args.reqs_file:
+            download_from_reqs(args.reqs_file, download_dir=download_dir,
+                               download_cache=args.download_cache)
+        else:
+            download_from_setup(args.setup_file, download_dir=download_dir,
+                                download_cache=args.download_cache)
+
+        post_process(output=args.output, download_dir=download_dir, python=args.python,
+                     remove_setup_cfg=args.remove_setup_cfg, ignore_build_errors=args.ignore_build_errors)
     finally:
         if not args.keep_dir:
             logger.debug('Removing temporal directory "%s"', download_dir)
